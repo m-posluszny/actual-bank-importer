@@ -1,0 +1,9 @@
+services:
+  actual-importer:
+    build: .
+    ports:
+      - "5008:5008"
+    volumes:
+      - ./importer-cache:/actual-data  # Persistence for the API cache
+    env_file: config.env
+
