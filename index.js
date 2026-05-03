@@ -70,9 +70,9 @@ async function buildCategoryLookup() {
 
 app.post('/import', async (req, res) => {
   try {
-    const { csvData, accountId, categoryMapping, accountMapping } = req.body;
-    if (!csvData || !accountId) {
-      return res.status(400).json({ error: "Brak csvData lub accountId" });
+    const { csvData, categoryMapping, accountMapping } = req.body;
+    if (!csvData) {
+      return res.status(400).json({ error: "Brak csvData" });
     }
 
     const result = await withActual(async () => {
@@ -82,11 +82,9 @@ app.post('/import', async (req, res) => {
         delimiter: ';'
       });
 
-      // Pobierz payees i kategorie raz
       const allPayees = await api.getPayees();
       const categoryGroups = await api.getCategoryGroups();
 
-      // Mapa: actualAccountId -> transfer payee ID
       const transferPayeeByAccountId = {};
       for (const payee of allPayees) {
         if (payee.transfer_acct) {
@@ -94,7 +92,6 @@ app.post('/import', async (req, res) => {
         }
       }
 
-      // Mapa: "GroupName/CategoryName" -> categoryId
       const categoryLookup = {};
       for (const group of categoryGroups) {
         for (const cat of group.categories || []) {
@@ -102,7 +99,6 @@ app.post('/import', async (req, res) => {
         }
       }
 
-      // Mapa: payee name (lowercase) -> payee ID
       const payeeLookup = {};
       for (const payee of allPayees) {
         if (payee.name) {
@@ -110,24 +106,37 @@ app.post('/import', async (req, res) => {
         }
       }
 
-      console.log("Transfer payees by account ID:", transferPayeeByAccountId);
-      console.log("Category lookup:", categoryLookup);
-      console.log("Account Mapping:", accountMapping);
-      console.log("Category Mapping:", categoryMapping);
+      const transactionsByAccount = {};
 
-      const transactions = records.map(row => {
-        const rawAmount = row['Kwota operacji']
-          ? row['Kwota operacji'].replace(',', '.').replace(/\s/g, '')
-          : '0';
-        const amount = Math.round(parseFloat(rawAmount) * 100);
-
-        const payeeName = row['Nadawca / Odbiorca'] || '';
+      for (const row of records) {
         const incomingAccountNumber = row['Rachunek źródłowy']
           ? row['Rachunek źródłowy'].replace(/\s/g, '').replace("'", "")
           : '';
         const targetAccountNumber = row['Rachunek docelowy']
           ? row['Rachunek docelowy'].replace(/\s/g, '').replace("'", "")
           : '';
+
+        const incomingInMapping = incomingAccountNumber && accountMapping?.[incomingAccountNumber];
+        const targetInMapping = targetAccountNumber && accountMapping?.[targetAccountNumber];
+
+        let accountId;
+        if (incomingInMapping && targetInMapping) {
+          accountId = incomingInMapping.id;
+        } else if (incomingInMapping) {
+          accountId = incomingInMapping.id;
+        } else if (targetInMapping) {
+          accountId = targetInMapping.id;
+        } else {
+          console.warn('Nie można przypisać konta dla wiersza:', row);
+          continue;
+        }
+
+        const rawAmount = row['Kwota operacji']
+          ? row['Kwota operacji'].replace(',', '.').replace(/\s/g, '')
+          : '0';
+        const amount = Math.round(parseFloat(rawAmount) * 100);
+        const payeeName = row['Nadawca / Odbiorca'] || '';
+        const payeeAdress = row['Adres nadawcy / odbiorcy'] || '';
         const title = row['Tytułem'] || '';
 
         let tx = {
@@ -141,21 +150,23 @@ app.post('/import', async (req, res) => {
           cleared: false,
         };
 
-        // 1. Logika transferów
-        const targetActualId =
-          targetAccountNumber && accountMapping?.[targetAccountNumber]?.id;
-        const incomingActualId =
-          incomingAccountNumber && accountMapping?.[incomingAccountNumber]?.id;
-
-        if (targetActualId && transferPayeeByAccountId[targetActualId]) {
-          tx.payee = transferPayeeByAccountId[targetActualId];
-          tx.category = null;
-        } else if (incomingActualId && transferPayeeByAccountId[incomingActualId]) {
-          tx.payee = transferPayeeByAccountId[incomingActualId];
+        if (incomingInMapping && targetInMapping) {
+          // Sprawdź znak kwoty żeby określić kierunek
+          if (amount > 0) {
+            // Wpływ na konto docelowe — transakcja na targetAccount, payee = transfer payee źródła
+            accountId = targetInMapping.id;
+            tx.account = accountId;
+            tx.payee = transferPayeeByAccountId[incomingInMapping.id];
+          } else {
+            // Wypływ z konta źródłowego — transakcja na sourceAccount, payee = transfer payee celu
+            accountId = incomingInMapping.id;
+            tx.account = accountId;
+            tx.payee = transferPayeeByAccountId[targetInMapping.id];
+          }
           tx.category = null;
         } else {
-          // 2. Zwykła transakcja — dopasowanie kategorii po nazwie
-          tx.payee_name = payeeName;
+          // Zwykła transakcja — mapowanie kategorii
+          tx.payee_name = payeeName + ' ' + payeeAdress;
           tx.category = null;
 
           if (categoryMapping) {
@@ -163,11 +174,9 @@ app.post('/import', async (req, res) => {
             const matchedKey = Object.keys(categoryMapping).find(key =>
               searchString.includes(key.toLowerCase())
             );
-
             if (matchedKey) {
               const categoryPath = categoryMapping[matchedKey];
               tx.category = categoryLookup[categoryPath] ?? null;
-
               if (!tx.category) {
                 console.warn(`Nie znaleziono kategorii dla ścieżki: "${categoryPath}"`);
               }
@@ -175,52 +184,55 @@ app.post('/import', async (req, res) => {
           }
         }
 
+        if (!transactionsByAccount[accountId]) {
+          transactionsByAccount[accountId] = [];
+        }
+        transactionsByAccount[accountId].push(tx);
         console.log('Przetwarzana transakcja:', tx);
-        return tx;
-      });
-
-      // Import transakcji
-      const importResult = await api.importTransactions(accountId, transactions);
-      const addedIds = new Set(importResult.added);
-
-      // Pobierz istniejące transakcje z całego zakresu dat jednym zapytaniem
-      const dates = transactions.map(t => t.date).sort();
-      const allExisting = await api.getTransactions(accountId, dates[0], dates[dates.length - 1]);
-
-      const existingByImportedId = {};
-      for (const e of allExisting) {
-        if (e.imported_id) existingByImportedId[e.imported_id] = e;
       }
 
-      // Zaktualizuj transakcje które już istniały i nie są cleared
-      for (const tx of transactions) {
-        if (!tx.imported_id) continue;
+      // Importuj per konto i zbierz wyniki
+      const allResults = { added: [], updated: [] };
 
-        const match = existingByImportedId[tx.imported_id];
-        if (!match || addedIds.has(match.id) || match.cleared) continue;
+      for (const [accountId, transactions] of Object.entries(transactionsByAccount)) {
+        console.log(`Importuję ${transactions.length} transakcji dla konta ${accountId}`);
+        const importResult = await api.importTransactions(accountId, transactions);
+        allResults.added.push(...(importResult.added || []));
+        allResults.updated.push(...(importResult.updated || []));
 
-        const updates = {};
+        // Aktualizuj istniejące niescleared
+        const addedIds = new Set(importResult.added);
+        const dates = transactions.map(t => t.date).sort();
+        const allExisting = await api.getTransactions(accountId, dates[0], dates[dates.length - 1]);
 
-        if (tx.payee) {
-          updates.payee = tx.payee;  // było: payee_id
-          updates.category = null;
-        } else {
-          if (tx.payee_name) {
-            const resolvedPayeeId = payeeLookup[tx.payee_name.toLowerCase()];
-            if (resolvedPayeeId) {
-              updates.payee = resolvedPayeeId;  // było: payee_id
-            }
-          }
-          if (tx.category !== undefined) {
-            updates.category = tx.category;
-          }
+        const existingByImportedId = {};
+        for (const e of allExisting) {
+          if (e.imported_id) existingByImportedId[e.imported_id] = e;
         }
 
-        console.log(`Aktualizuję transakcję ${match.id}:`, updates);
-        await api.updateTransaction(match.id, updates);
+        for (const tx of transactions) {
+          if (!tx.imported_id) continue;
+          const match = existingByImportedId[tx.imported_id];
+          if (!match || addedIds.has(match.id) || match.cleared) continue;
+
+          const updates = {};
+          if (tx.payee) {
+            updates.payee = tx.payee;
+            updates.category = null;
+          } else {
+            if (tx.payee_name) {
+              const resolvedPayeeId = payeeLookup[tx.payee_name.toLowerCase()];
+              if (resolvedPayeeId) updates.payee = resolvedPayeeId;
+            }
+            if (tx.category !== undefined) updates.category = tx.category;
+          }
+
+          console.log(`Aktualizuję transakcję ${match.id}:`, updates);
+          await api.updateTransaction(match.id, updates);
+        }
       }
 
-      return importResult;
+      return allResults;
     });
 
     res.json({ success: true, result });
